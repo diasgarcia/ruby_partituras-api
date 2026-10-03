@@ -1,0 +1,17 @@
+one:
+  titulo: "Asturias (Leyenda)"
+  autor: "Isaac Albéniz"
+  arranjador: "Andrés Segovia"
+  bpm: 120
+  tonalidade: "Em"
+  avaliacao: 5
+  data_criacao: "2026-01-01"
+
+two:
+  titulo: "Recuerdos de la Alhambra"
+  autor: "Francisco Tárrega"
+  arranjador: "Francisco Tárrega"
+  bpm: 80
+  tonalidade: "Am"
+  avaliacao: 5
+  data_criacao: "2026-01-02"
