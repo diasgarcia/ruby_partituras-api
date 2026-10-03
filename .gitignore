@@ -1,0 +1,28 @@
+# Configurações locais, dependências instaladas e variáveis de ambiente.
+/.bundle/
+/vendor/bundle/
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Chaves do Rails; os arquivos de credenciais criptografadas podem ser versionados.
+/config/*.key
+/config/credentials/*.key
+
+# Logs, caches, PID files, relatórios do Bruno e cópias temporárias.
+/log/*
+/tmp/*
+!/log/.keep
+!/tmp/.keep
+/coverage/
+/storage/
+*.sqlite3
+*.sqlite3-*
+
+# Arquivos pessoais de editores e do sistema operacional.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
