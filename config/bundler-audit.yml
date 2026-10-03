@@ -1,0 +1,2 @@
+# Auditoria das dependências; nenhuma vulnerabilidade é ignorada por padrão.
+ignore: []
