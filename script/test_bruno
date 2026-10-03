@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# API e banco próprios para o Bruno, sem seeds ou limpeza de bancos existentes.
+export RAILS_ENV=test
+# DATABASE_URL herdada poderia apontar para o banco de desenvolvimento.
+unset DATABASE_URL
+export DB_TEST_NAME="${DB_BRUNO_NAME:-ruby_partituras_api_bruno_test}"
+port="${BRUNO_PORT:-3001}"
+base_url="http://127.0.0.1:$port"
+
+if command -v node >/dev/null 2>&1 && node "$PWD/script/test-bruno.cjs" --check-cli >/dev/null 2>&1; then
+  node_command=node
+  runner="$PWD/script/test-bruno.cjs"
+elif command -v node.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+  node_command=node.exe
+  runner="$(wslpath -w "$PWD/script/test-bruno.cjs")"
+  "$node_command" "$runner" --check-cli
+else
+  printf '%s\n' 'Instale Node.js 22+ e a CLI: npm install -g @usebruno/cli@4.1.0' >&2
+  exit 1
+fi
+
+if [ "${BRUNO_SKIP_DOCKER:-0}" != 1 ]; then
+  docker compose up -d db
+fi
+bundle check >/dev/null || bundle install
+bin/rails db:create db:migrate
+if curl --silent --max-time 2 "$base_url/up" >/dev/null 2>&1; then
+  printf 'Porta %s já está ocupada. Escolha outra com BRUNO_PORT.\n' "$port" >&2
+  exit 1
+fi
+mkdir -p tmp
+run_directory="$(mktemp -d "$PWD/tmp/bruno-api.XXXXXX")"
+bin/rails server -b 127.0.0.1 -p "$port" -P "$run_directory/server.pid" >"$run_directory/server.log" 2>&1 &
+server_pid=$!
+cleanup() {
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ready=false
+for attempt in {1..60}; do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    printf 'Rails não iniciou. Consulte %s/server.log\n' "$run_directory" >&2
+    exit 1
+  fi
+  if curl --silent --fail "$base_url/up" >/dev/null; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" != true ]; then
+  printf 'API não ficou pronta. Consulte %s/server.log\n' "$run_directory" >&2
+  exit 1
+fi
+
+"$node_command" "$runner" "$base_url" "${1:-}"

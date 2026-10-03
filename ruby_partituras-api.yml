@@ -1,0 +1,402 @@
+opencollection: 1.0.0
+info:
+  name: ruby_partituras-api
+request:
+  variables:
+    - name: baseUrl
+      value: http://localhost:3000
+    - name: runId
+      value: ''
+  headers:
+    - name: Accept
+      value: application/json
+  scripts:
+    - type: before-request
+      code: |
+        const scenario = bru.getRequestVar("scenario");
+        const baseUrl = bru.interpolate("{{baseUrl}}").replace(/\/$/, "");
+        const runId = bru.interpolate("{{runId}}");
+        const token = `${runId || "manual"}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const state = { scenario, baseUrl, owned: [], original: null, other: null };
+        async function api(method, route, data) {
+          const response = await bru.sendRequest({
+            method, url: `${baseUrl}${route}`, data, timeout: 10000,
+            headers: { "Content-Type": "application/json", Accept: "application/json" }
+          });
+          if (response.status < 200 || response.status >= 300) throw new Error(`${method} ${route}: ${response.status}`);
+          return response;
+        }
+        function payload(label) {
+          return {
+            titulo: `Bruno ${token} ${label}`, autor: `Autor Bruno ${token} ${label}`,
+            arranjador: "Arranjador do teste", bpm: 90, avaliacao: 4, tonalidade: "Am"
+          };
+        }
+        function own(data) {
+          const target = { titulo: data.titulo, autor: data.autor };
+          state.owned.push(target);
+          return target;
+        }
+        async function createFixture(label) {
+          const data = payload(label);
+          const target = own(data);
+          const created = await api("POST", "/partituras", data);
+          if (created.status !== 201) throw new Error("Fixture não foi criada com status 201");
+          const listing = await api("GET", "/partituras");
+          const matches = listing.data.filter(item => item.titulo === data.titulo && item.autor === data.autor);
+          if (matches.length !== 1) throw new Error("Não foi possível descobrir o ID da fixture");
+          target.id = matches[0].id;
+          return (await api("GET", `/partituras/${target.id}`)).data;
+        }
+        async function cleanup() {
+          if (!state.owned.length) return;
+          const listing = await api("GET", "/partituras");
+          const failures = [];
+          for (const item of listing.data.filter(item => state.owned.some(target =>
+            target.id === item.id || (target.titulo === item.titulo && target.autor === item.autor)))) {
+            try { await api("DELETE", `/partituras/${item.id}`); }
+            catch (error) { failures.push(String(error)); }
+          }
+          if (failures.length) throw new Error(`Limpeza da preparação: ${failures.join("; ")}`);
+        }
+        try {
+          let data = payload("principal");
+          if (["list", "show", "create_duplicate", "update", "update_same", "update_duplicate",
+            "update_invalid", "delete", "show_missing", "update_missing", "delete_missing"].includes(scenario)) {
+            state.original = await createFixture("principal");
+            bru.setVar("partituraId", state.original.id);
+          }
+          if (scenario === "update_duplicate") {
+            state.other = await createFixture("outra");
+            data = { ...state.other, arranjador: "Tentativa conflitante" };
+          }
+          if (scenario === "create_duplicate" || scenario === "update_same") data = { ...state.original };
+          if (scenario === "update") {
+            data = { ...payload("atualizada"), arranjador: "Novo arranjador", bpm: 125,
+              avaliacao: 5, tonalidade: "Em", dataCriacao: "1999-01-01" };
+          }
+          if (scenario === "update_invalid") data = { ...state.original, bpm: null };
+          if (scenario === "create_optional") { delete data.bpm; delete data.avaliacao; }
+          if (scenario === "create_normalized") data.tonalidade = "C_SHARP";
+          if (scenario === "create_invalid_required") delete data.arranjador;
+          if (scenario === "create_invalid_bpm") data.bpm = 0;
+          if (scenario === "create_invalid_rating_low") data.avaliacao = 0;
+          if (scenario === "create_invalid_rating_high") data.avaliacao = 6;
+          if (scenario === "create_invalid_key") data.tonalidade = "XYZ";
+          if (scenario.endsWith("_missing")) await api("DELETE", `/partituras/${state.original.id}`);
+          if (scenario.startsWith("create") || scenario === "update") own(data);
+          state.payload = data;
+          bru.setVar("payload", JSON.stringify(data));
+          bru.setVar("brunoTestState", state);
+        } catch (error) {
+          try { await cleanup(); }
+          catch (cleanupError) { throw new Error(`${error}; ${cleanupError}`); }
+          throw error;
+        }
+    - type: tests
+      code: |
+        const state = bru.getVar("brunoTestState");
+        const scenario = state.scenario;
+        const expectedStatus = scenario === "health" || scenario === "list" || scenario === "show" ? 200 :
+          ["create", "create_optional", "create_normalized"].includes(scenario) ? 201 :
+          ["update", "update_same", "delete"].includes(scenario) ? 204 :
+          scenario.endsWith("_missing") ? 404 : 400;
+        async function api(method, route) {
+          const response = await bru.sendRequest({
+            method, url: `${state.baseUrl}${route}`, timeout: 10000, headers: { Accept: "application/json" }
+          });
+          if (response.status < 200 || response.status >= 300) throw new Error(`${method} ${route}: ${response.status}`);
+          return response;
+        }
+        function belongsToTest(item) {
+          return state.owned.some(target => target.id === item.id ||
+            (target.titulo === item.titulo && target.autor === item.autor));
+        }
+        function expectDetails(item, expected) {
+          expect(item).to.have.all.keys("id", "titulo", "autor", "arranjador", "bpm", "avaliacao", "dataCriacao", "tonalidade");
+          expect(item.id).to.be.a("number").and.to.be.greaterThan(0);
+          for (const field of ["titulo", "autor", "arranjador", "bpm", "avaliacao", "tonalidade"]) {
+            expect(item[field], field).to.equal(expected[field] === undefined ? null : expected[field]);
+          }
+          expect(item.dataCriacao).to.match(/^\d{4}-\d{2}-\d{2}$/);
+        }
+        try {
+          await test(`HTTP ${expectedStatus}`, () => expect(res.getStatus()).to.equal(expectedStatus));
+          if (scenario !== "health" && ![201, 204].includes(expectedStatus)) {
+            await test("Resposta JSON", () => expect(res.getHeader("content-type")).to.include("application/json"));
+          }
+          if ([201, 204].includes(expectedStatus)) {
+            await test("Corpo vazio", () => expect(res.getBody()).to.equal(""));
+          }
+          if (scenario === "list") {
+            await test("Listagem contém a fixture no formato resumido", () => {
+              const items = res.getBody();
+              expect(items).to.be.an("array");
+              expect(items.find(item => item.id === state.original.id)).to.deep.equal({
+                id: state.original.id, titulo: state.original.titulo,
+                autor: state.original.autor, avaliacao: state.original.avaliacao
+              });
+            });
+          }
+          if (scenario === "show") {
+            await test("Detalhes da fixture", () => {
+              expectDetails(res.getBody(), state.original);
+              expect(res.getBody().dataCriacao).to.equal(state.original.dataCriacao);
+            });
+          }
+          if (["create", "create_optional", "create_normalized"].includes(scenario)) {
+            await test("Criação persiste os campos e gera a data", async () => {
+              const listing = await api("GET", "/partituras");
+              const matches = listing.data.filter(item => item.titulo === state.payload.titulo && item.autor === state.payload.autor);
+              expect(matches, "registro criado pela requisição").to.have.lengthOf(1);
+              const created = (await api("GET", `/partituras/${matches[0].id}`)).data;
+              const expected = { ...state.payload };
+              if (scenario === "create_normalized") expected.tonalidade = "C#";
+              expectDetails(created, expected);
+              // Tolera a diferença de fuso entre o cliente e o servidor.
+              const dates = [-1, 0, 1].map(offset => new Date(Date.now() + offset * 86400000).toISOString().slice(0, 10));
+              expect(dates, "data atual do servidor").to.include(created.dataCriacao);
+            });
+          }
+          if (expectedStatus === 400) {
+            await test("Erro de validação estruturado", () => {
+              const body = res.getBody();
+              expect(body.message).to.be.a("string").and.not.to.equal("");
+              expect(body.errors).to.be.an("array").and.not.to.be.empty;
+              if (scenario.includes("duplicate")) expect(body.errors).to.include("já existe uma partitura com esse nome e esse autor");
+            });
+          }
+          if (scenario.startsWith("create_invalid")) {
+            await test("POST inválido não cria registro", async () => {
+              const listing = await api("GET", "/partituras");
+              expect(listing.data.filter(item => item.titulo === state.payload.titulo && item.autor === state.payload.autor)).to.be.empty;
+            });
+          }
+          if (scenario === "create_duplicate") {
+            await test("Duplicidade não cria outro registro", async () => {
+              const listing = await api("GET", "/partituras");
+              expect(listing.data.filter(item => item.titulo === state.original.titulo && item.autor === state.original.autor)).to.have.lengthOf(1);
+            });
+          }
+          if (["update", "update_same"].includes(scenario)) {
+            await test("Atualização persiste os campos e preserva dataCriacao", async () => {
+              const updated = (await api("GET", `/partituras/${state.original.id}`)).data;
+              expectDetails(updated, state.payload);
+              expect(updated.dataCriacao).to.equal(state.original.dataCriacao);
+            });
+          }
+          if (["update_duplicate", "update_invalid"].includes(scenario)) {
+            await test("Atualização rejeitada preserva os registros", async () => {
+              expect((await api("GET", `/partituras/${state.original.id}`)).data).to.deep.equal(state.original);
+              if (state.other) expect((await api("GET", `/partituras/${state.other.id}`)).data).to.deep.equal(state.other);
+            });
+          }
+          if (scenario === "delete" || scenario.endsWith("_missing")) {
+            await test("ID removido está ausente da listagem", async () => {
+              const listing = await api("GET", "/partituras");
+              expect(listing.data.some(item => item.id === state.original.id)).to.equal(false);
+            });
+          }
+          if (expectedStatus === 404) {
+            await test("Mensagem de recurso inexistente", () =>
+              expect(res.getBody()).to.deep.equal({ message: "partitura não encontrada" }));
+          }
+        } finally {
+          if (state.owned.length) {
+            await test("Limpeza dos registros deste cenário", async () => {
+              const listing = await api("GET", "/partituras");
+              const failures = [];
+              for (const item of listing.data.filter(belongsToTest)) {
+                try {
+                  const removed = await api("DELETE", `/partituras/${item.id}`);
+                  if (removed.status !== 204) failures.push(`DELETE ${item.id}: ${removed.status}`);
+                } catch (error) { failures.push(String(error)); }
+              }
+              const remaining = await api("GET", "/partituras");
+              expect(failures, "erros na limpeza").to.be.empty;
+              expect(remaining.data.filter(belongsToTest), "registros restantes").to.be.empty;
+            });
+          }
+          bru.deleteVar("brunoTestState");
+          bru.deleteVar("partituraId");
+          bru.deleteVar("payload");
+        }
+items:
+  - info: { name: 'API disponível', type: http, seq: 1 }
+    http:
+      method: GET
+      url: '{{baseUrl}}/up'
+    runtime:
+      variables: [{ name: scenario, value: health }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Listar partituras', type: http, seq: 2 }
+    http:
+      method: GET
+      url: '{{baseUrl}}/partituras'
+    runtime:
+      variables: [{ name: scenario, value: list }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Detalhar partitura', type: http, seq: 3 }
+    http:
+      method: GET
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+    runtime:
+      variables: [{ name: scenario, value: show }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Criar partitura', type: http, seq: 4 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Criar sem campos opcionais', type: http, seq: 5 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_optional }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Normalizar tonalidade do enum Java', type: http, seq: 6 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_normalized }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar criação duplicada', type: http, seq: 7 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_duplicate }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar arranjador ausente', type: http, seq: 8 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_invalid_required }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar bpm zero', type: http, seq: 9 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_invalid_bpm }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar avaliação abaixo de 1', type: http, seq: 10 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_invalid_rating_low }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar avaliação acima de 5', type: http, seq: 11 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_invalid_rating_high }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar tonalidade inválida', type: http, seq: 12 }
+    http:
+      method: POST
+      url: '{{baseUrl}}/partituras'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: create_invalid_key }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Atualizar partitura', type: http, seq: 13 }
+    http:
+      method: PUT
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: update }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Atualizar com os mesmos dados', type: http, seq: 14 }
+    http:
+      method: PUT
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: update_same }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar atualização duplicada', type: http, seq: 15 }
+    http:
+      method: PUT
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: update_duplicate }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Rejeitar atualização sem bpm', type: http, seq: 16 }
+    http:
+      method: PUT
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: update_invalid }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Excluir partitura', type: http, seq: 17 }
+    http:
+      method: DELETE
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+    runtime:
+      variables: [{ name: scenario, value: delete }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Detalhar ID inexistente', type: http, seq: 18 }
+    http:
+      method: GET
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+    runtime:
+      variables: [{ name: scenario, value: show_missing }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Atualizar ID inexistente', type: http, seq: 19 }
+    http:
+      method: PUT
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+      body: { type: json, data: '{{payload}}' }
+    runtime:
+      variables: [{ name: scenario, value: update_missing }]
+    settings:
+      timeout: 10000
+  - info: { name: 'Excluir ID inexistente', type: http, seq: 20 }
+    http:
+      method: DELETE
+      url: '{{baseUrl}}/partituras/{{partituraId}}'
+    runtime:
+      variables: [{ name: scenario, value: delete_missing }]
+    settings:
+      timeout: 10000
+bundled: true
+extensions:
+  bruno:
+    ignore: [node_modules, .git]
